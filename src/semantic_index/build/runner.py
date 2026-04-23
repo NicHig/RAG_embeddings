@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import logging
+import re
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any
+
+from openai import RateLimitError
 
 from semantic_index.config.settings import Settings
 from semantic_index.db.init_db import initialize_database
@@ -14,6 +19,86 @@ from semantic_index.pipeline.vector_store import vector_to_blob
 from semantic_index.pipeline.window_builder import build_windows
 
 LOGGER = logging.getLogger(__name__)
+RATE_LIMIT_SECONDS_RE = re.compile(r"try again in ([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
+RATE_LIMIT_LIMIT_RE = re.compile(r"Limit\s+([0-9]+)", re.IGNORECASE)
+
+
+class AdaptiveRateController:
+    def __init__(self, settings: Settings):
+        self.config_batch_size = settings.embed_batch_size
+        self.config_token_budget = settings.embed_token_budget
+        self.current_batch_size = settings.embed_batch_size
+        self.current_token_budget = settings.embed_token_budget
+        self.min_batch_size = settings.embed_min_batch_size
+        self.min_token_budget = settings.embed_min_token_budget
+        self.tpm_limit = settings.openai_tpm_limit
+        self.tpm_target_ratio = settings.openai_tpm_target_ratio
+        self.base_sleep = settings.rate_limit_base_sleep_seconds
+        self.max_sleep = settings.rate_limit_max_sleep_seconds
+        self.sent_batches: deque[tuple[float, int]] = deque()
+
+    def effective_batch_size(self) -> int:
+        return max(self.min_batch_size, self.current_batch_size)
+
+    def effective_token_budget(self) -> int:
+        return max(self.min_token_budget, self.current_token_budget)
+
+    def wait_for_capacity(self, next_batch_tokens: int) -> None:
+        if self.tpm_limit is None:
+            return
+        while True:
+            self._prune_sent()
+            used_tokens = sum(tokens for _, tokens in self.sent_batches)
+            target_limit = int(self.tpm_limit * self.tpm_target_ratio)
+            if used_tokens + next_batch_tokens <= target_limit:
+                return
+            now = time.time()
+            oldest_timestamp, _ = self.sent_batches[0]
+            sleep_for = max(1.0, 60.0 - (now - oldest_timestamp) + 0.25)
+            LOGGER.info(
+                "Pausing for TPM capacity used_tokens=%s next_batch_tokens=%s target_limit=%s sleep=%.2fs",
+                used_tokens,
+                next_batch_tokens,
+                target_limit,
+                sleep_for,
+            )
+            time.sleep(min(sleep_for, self.max_sleep))
+
+    def record_success(self, batch_tokens: int) -> None:
+        self.sent_batches.append((time.time(), batch_tokens))
+        self._prune_sent()
+        self.current_batch_size = min(
+            self.config_batch_size, max(self.min_batch_size, self.current_batch_size + 5)
+        )
+        self.current_token_budget = min(
+            self.config_token_budget,
+            max(self.min_token_budget, int(self.current_token_budget * 1.1)),
+        )
+
+    def record_rate_limit(self, error: RateLimitError) -> float:
+        message = _rate_limit_message(error)
+        parsed_limit = _parse_rate_limit_tpm_limit(message)
+        if parsed_limit is not None:
+            self.tpm_limit = parsed_limit
+        self.current_batch_size = max(self.min_batch_size, max(1, self.current_batch_size // 2))
+        self.current_token_budget = max(
+            self.min_token_budget, max(1, self.current_token_budget // 2)
+        )
+        retry_after = _parse_retry_after_seconds(message) or self.base_sleep
+        sleep_for = min(max(retry_after + 0.5, self.base_sleep), self.max_sleep)
+        LOGGER.warning(
+            "Rate limit encountered tpm_limit=%s next_batch_size=%s next_token_budget=%s sleep=%.2fs",
+            self.tpm_limit,
+            self.current_batch_size,
+            self.current_token_budget,
+            sleep_for,
+        )
+        return sleep_for
+
+    def _prune_sent(self) -> None:
+        cutoff = time.time() - 60.0
+        while self.sent_batches and self.sent_batches[0][0] < cutoff:
+            self.sent_batches.popleft()
 
 
 def _configure_logging(level: str) -> None:
@@ -217,27 +302,58 @@ def _embed_pending_windows(
     build_id: int,
 ) -> int:
     processed = 0
+    controller = AdaptiveRateController(settings)
     while True:
         rows = repository.fetch_pending_windows(
             build_id=build_id,
-            limit=max(settings.embed_batch_size * 2, settings.embed_batch_size),
+            limit=max(controller.effective_batch_size() * 2, controller.effective_batch_size()),
         )
         if not rows:
             break
 
         batch_rows = _select_embedding_batch(
             rows=rows,
-            batch_size=settings.embed_batch_size,
-            token_budget=settings.embed_token_budget,
+            batch_size=controller.effective_batch_size(),
+            token_budget=controller.effective_token_budget(),
         )
+        batch_tokens = sum(int(row["token_count_est"]) for row in batch_rows)
+        controller.wait_for_capacity(batch_tokens)
         texts = [row["window_text"] for row in batch_rows]
         LOGGER.info(
             "Embedding batch for build_id=%s windows=%s approx_tokens=%s",
             build_id,
             len(batch_rows),
-            sum(int(row["token_count_est"]) for row in batch_rows),
+            batch_tokens,
         )
-        embeddings = embedder.embed_texts(texts)
+        embeddings = None
+        while True:
+            try:
+                embeddings = embedder.embed_texts(texts)
+                break
+            except RateLimitError as exc:
+                sleep_for = controller.record_rate_limit(exc)
+                smaller_batch_needed = (
+                    len(batch_rows) > controller.effective_batch_size()
+                    or batch_tokens > controller.effective_token_budget()
+                )
+                time.sleep(sleep_for)
+                if smaller_batch_needed:
+                    LOGGER.info(
+                        "Reselecting smaller batch after rate limit build_id=%s prior_windows=%s prior_tokens=%s",
+                        build_id,
+                        len(batch_rows),
+                        batch_tokens,
+                    )
+                    embeddings = None
+                    break
+                LOGGER.info(
+                    "Retrying same embedding batch after rate limit build_id=%s windows=%s approx_tokens=%s",
+                    build_id,
+                    len(batch_rows),
+                    batch_tokens,
+                )
+        if embeddings is None:
+            continue
         vector_items = []
         for row, embedding in zip(batch_rows, embeddings, strict=True):
             dims, blob = vector_to_blob(embedding)
@@ -247,6 +363,7 @@ def _embed_pending_windows(
             embedding_model=settings.openai_embedding_model,
             items=vector_items,
         )
+        controller.record_success(batch_tokens)
         processed += len(batch_rows)
 
     return processed
@@ -264,6 +381,25 @@ def _select_embedding_batch(
         selected.append(row)
         tokens += row_tokens
     return selected or rows[:1]
+
+
+def _rate_limit_message(error: RateLimitError) -> str:
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        nested = body.get("error")
+        if isinstance(nested, dict) and nested.get("message"):
+            return str(nested["message"])
+    return str(error)
+
+
+def _parse_retry_after_seconds(message: str) -> float | None:
+    match = RATE_LIMIT_SECONDS_RE.search(message)
+    return None if match is None else float(match.group(1))
+
+
+def _parse_rate_limit_tpm_limit(message: str) -> int | None:
+    match = RATE_LIMIT_LIMIT_RE.search(message)
+    return None if match is None else int(match.group(1))
 
 
 def _determine_dirty_record_ids(

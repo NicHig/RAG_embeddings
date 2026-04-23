@@ -1,9 +1,13 @@
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
 from semantic_index.build import runner
 from semantic_index.build.runner import (
+    AdaptiveRateController,
+    _parse_rate_limit_tpm_limit,
+    _parse_retry_after_seconds,
     build_incremental,
     build_plaintiff,
     init_db,
@@ -96,3 +100,31 @@ def test_failed_embedding_marks_build_failed(settings, monkeypatch):
         ).fetchone()
     assert row[0] == "failed"
     assert "embedding exploded" in row[1]
+
+
+def test_rate_limit_parsing_helpers():
+    message = (
+        "Rate limit reached for text-embedding-3-small on tokens per min (TPM): "
+        "Limit 1000000, Used 882346, Requested 150974. Please try again in 1.999s."
+    )
+    assert _parse_rate_limit_tpm_limit(message) == 1000000
+    assert _parse_retry_after_seconds(message) == 1.999
+
+
+def test_rate_limit_controller_shrinks_after_429(settings):
+    controller = AdaptiveRateController(settings)
+    error = SimpleNamespace(
+        body={
+            "error": {
+                "message": (
+                    "Rate limit reached for text-embedding-3-small on tokens per min (TPM): "
+                    "Limit 1000000, Used 882346, Requested 150974. Please try again in 1.999s."
+                )
+            }
+        }
+    )
+    sleep_for = controller.record_rate_limit(error)  # type: ignore[arg-type]
+    assert controller.tpm_limit == 1000000
+    assert controller.effective_batch_size() == 50
+    assert controller.effective_token_budget() == 125000
+    assert sleep_for >= 2.0

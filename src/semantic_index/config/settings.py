@@ -29,7 +29,13 @@ class Settings:
     window_stride_units: int = 1
     embed_batch_size: int = 100
     embed_token_budget: int = 250000
+    embed_min_batch_size: int = 10
+    embed_min_token_budget: int = 25000
     embedding_mode: str = "sync"
+    openai_tpm_limit: int | None = None
+    openai_tpm_target_ratio: float = 0.85
+    rate_limit_base_sleep_seconds: float = 2.0
+    rate_limit_max_sleep_seconds: float = 30.0
     log_level: str = "INFO"
 
     @classmethod
@@ -57,7 +63,23 @@ class Settings:
             window_stride_units=int(os.environ.get("WINDOW_STRIDE_UNITS", "1")),
             embed_batch_size=int(os.environ.get("EMBED_BATCH_SIZE", "100")),
             embed_token_budget=int(os.environ.get("EMBED_TOKEN_BUDGET", "250000")),
+            embed_min_batch_size=int(os.environ.get("EMBED_MIN_BATCH_SIZE", "10")),
+            embed_min_token_budget=int(os.environ.get("EMBED_MIN_TOKEN_BUDGET", "25000")),
             embedding_mode=os.environ.get("EMBEDDING_MODE", "sync"),
+            openai_tpm_limit=(
+                int(os.environ["OPENAI_TPM_LIMIT"])
+                if os.environ.get("OPENAI_TPM_LIMIT")
+                else None
+            ),
+            openai_tpm_target_ratio=float(
+                os.environ.get("OPENAI_TPM_TARGET_RATIO", "0.85")
+            ),
+            rate_limit_base_sleep_seconds=float(
+                os.environ.get("RATE_LIMIT_BASE_SLEEP_SECONDS", "2.0")
+            ),
+            rate_limit_max_sleep_seconds=float(
+                os.environ.get("RATE_LIMIT_MAX_SLEEP_SECONDS", "30.0")
+            ),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )
 
