@@ -1,6 +1,15 @@
 import sqlite3
 
-from semantic_index.build.runner import build_incremental, build_plaintiff, init_db, validate_build
+import pytest
+
+from semantic_index.build import runner
+from semantic_index.build.runner import (
+    build_incremental,
+    build_plaintiff,
+    init_db,
+    resume_build,
+    validate_build,
+)
 
 
 def test_plaintiff_build_creates_scoped_windows_and_vectors(settings):
@@ -32,7 +41,7 @@ def test_incremental_build_only_rebuilds_dirty_records(settings):
     init_db(settings)
     build_plaintiff(settings, cgid="SAMPLE-001")
     first_incremental = build_incremental(settings)
-    assert first_incremental["record_count"] == 1
+    assert first_incremental["record_count"] == 2
 
     with sqlite3.connect(settings.unit_text_db_path) as conn:
         conn.execute(
@@ -48,3 +57,42 @@ def test_incremental_build_only_rebuilds_dirty_records(settings):
     second_incremental = build_incremental(settings)
     assert second_incremental["record_count"] == 1
     assert second_incremental["window_count"] == 1
+
+
+def test_resume_build_embeds_only_pending_windows(settings):
+    init_db(settings)
+    build_result = build_plaintiff(settings, cgid="SAMPLE-001")
+
+    with sqlite3.connect(settings.semantic_index_db_path) as conn:
+        conn.execute(
+            "DELETE FROM semantic_vectors WHERE window_id = (SELECT window_id FROM semantic_windows LIMIT 1)"
+        )
+        conn.execute(
+            "UPDATE semantic_builds SET status = 'failed', completed_at = NULL WHERE build_id = ?",
+            (build_result["build_id"],),
+        )
+        conn.commit()
+
+    resumed = resume_build(settings, build_id=build_result["build_id"])
+    assert resumed["status"] == "completed"
+    assert resumed["processed_windows"] == 1
+    assert resumed["pending_windows"] == 0
+
+
+def test_failed_embedding_marks_build_failed(settings, monkeypatch):
+    class FailingEmbedder:
+        def embed_texts(self, texts):
+            raise RuntimeError("embedding exploded")
+
+    monkeypatch.setattr(runner, "_get_embedder", lambda settings: FailingEmbedder())
+
+    init_db(settings)
+    with pytest.raises(RuntimeError, match="embedding exploded"):
+        runner.build_plaintiff(settings, cgid="SAMPLE-001")
+
+    with sqlite3.connect(settings.semantic_index_db_path) as conn:
+        row = conn.execute(
+            "SELECT status, notes FROM semantic_builds ORDER BY build_id DESC LIMIT 1"
+        ).fetchone()
+    assert row[0] == "failed"
+    assert "embedding exploded" in row[1]

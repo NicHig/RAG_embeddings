@@ -76,6 +76,19 @@ class SemanticRepository:
             )
             conn.commit()
 
+    def get_build(self, build_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM semantic_builds WHERE build_id = ?",
+                (build_id,),
+            ).fetchone()
+
+    def latest_build(self) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM semantic_builds ORDER BY build_id DESC LIMIT 1"
+            ).fetchone()
+
     def insert_windows(self, rows: Iterable[WindowRecord]) -> list[int]:
         rows = list(rows)
         with self.connect() as conn:
@@ -114,6 +127,81 @@ class SemanticRepository:
                     (build_id,),
                 )
             )
+
+    def fetch_pending_windows(self, build_id: int, limit: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT w.window_id, w.window_text, w.token_count_est
+                    FROM semantic_windows w
+                    LEFT JOIN semantic_vectors v ON v.window_id = w.window_id
+                    WHERE w.build_id = ? AND v.window_id IS NULL
+                    ORDER BY w.window_id
+                    LIMIT ?
+                    """,
+                    (build_id, limit),
+                )
+            )
+
+    def count_windows_for_build(self, build_id: int) -> int:
+        with self.connect() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM semantic_windows WHERE build_id = ?",
+                    (build_id,),
+                ).fetchone()["count"]
+            )
+
+    def count_pending_windows(self, build_id: int) -> int:
+        with self.connect() as conn:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM semantic_windows w
+                    LEFT JOIN semantic_vectors v ON v.window_id = w.window_id
+                    WHERE w.build_id = ? AND v.window_id IS NULL
+                    """,
+                    (build_id,),
+                ).fetchone()["count"]
+            )
+
+    def latest_completed_build_id(self, cgid_scope: str | None = None) -> int | None:
+        query = """
+            SELECT build_id
+            FROM semantic_builds
+            WHERE status = 'completed' AND cgid_scope IS ?
+            ORDER BY build_id DESC
+            LIMIT 1
+        """
+        with self.connect() as conn:
+            row = conn.execute(query, (cgid_scope,)).fetchone()
+            return None if row is None else int(row["build_id"])
+
+    def record_state_for_build(self, build_id: int) -> dict[int, tuple[str | None, str, str]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    record_id,
+                    source_content_hash,
+                    source_max_updated_at,
+                    source_unit_signature
+                FROM semantic_windows
+                WHERE build_id = ?
+                GROUP BY record_id
+                """,
+                (build_id,),
+            ).fetchall()
+        return {
+            int(row["record_id"]): (
+                row["source_content_hash"],
+                row["source_max_updated_at"],
+                row["source_unit_signature"],
+            )
+            for row in rows
+        }
 
     def insert_vectors(
         self,
@@ -185,4 +273,10 @@ class SemanticRepository:
             conn.execute(
                 f"DELETE FROM semantic_windows WHERE record_id IN ({placeholders})", record_ids
             )
+            conn.commit()
+
+    def delete_build_output(self, build_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM semantic_vectors WHERE build_id = ?", (build_id,))
+            conn.execute("DELETE FROM semantic_windows WHERE build_id = ?", (build_id,))
             conn.commit()

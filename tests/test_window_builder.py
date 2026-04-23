@@ -1,6 +1,7 @@
 from semantic_index.pipeline.tokenizer import estimate_tokens
 from semantic_index.pipeline.types import SourceUnit
 from semantic_index.pipeline.window_builder import build_windows
+from semantic_index.build.runner import _select_embedding_batch
 
 
 def test_build_windows_for_three_units():
@@ -39,3 +40,13 @@ def test_build_windows_skips_missing_text_and_records_warning():
     )
     assert len(windows) == 1
     assert warnings
+
+
+def test_select_embedding_batch_respects_batch_size_and_token_budget():
+    rows = [
+        {"window_id": 1, "window_text": "a", "token_count_est": 100},
+        {"window_id": 2, "window_text": "b", "token_count_est": 120},
+        {"window_id": 3, "window_text": "c", "token_count_est": 90},
+    ]
+    selected = _select_embedding_batch(rows=rows, batch_size=2, token_budget=210)
+    assert [row["window_id"] for row in selected] == [1]
