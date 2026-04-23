@@ -1,0 +1,2 @@
+"""Semantic vector asset builder."""
+
