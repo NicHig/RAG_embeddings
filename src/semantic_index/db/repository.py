@@ -98,11 +98,13 @@ class SemanticRepository:
                     """
                     INSERT INTO semantic_windows (
                         build_id, cgid, record_id, doc_id, start_unit_no, end_unit_no,
+                        segment_index, segment_count,
                         window_text, char_len, token_count_est, text_hash,
                         source_content_hash, source_max_updated_at, source_unit_signature,
                         created_at
                     ) VALUES (
                         :build_id, :cgid, :record_id, :doc_id, :start_unit_no, :end_unit_no,
+                        :segment_index, :segment_count,
                         :window_text, :char_len, :token_count_est, :text_hash,
                         :source_content_hash, :source_max_updated_at, :source_unit_signature,
                         :created_at
@@ -133,7 +135,24 @@ class SemanticRepository:
             return list(
                 conn.execute(
                     """
-                    SELECT w.window_id, w.window_text, w.token_count_est
+                    SELECT
+                        w.window_id,
+                        w.build_id,
+                        w.cgid,
+                        w.record_id,
+                        w.doc_id,
+                        w.start_unit_no,
+                        w.end_unit_no,
+                        w.segment_index,
+                        w.segment_count,
+                        w.window_text,
+                        w.char_len,
+                        w.token_count_est,
+                        w.text_hash,
+                        w.source_content_hash,
+                        w.source_max_updated_at,
+                        w.source_unit_signature,
+                        w.created_at
                     FROM semantic_windows w
                     LEFT JOIN semantic_vectors v ON v.window_id = w.window_id
                     WHERE w.build_id = ? AND v.window_id IS NULL
@@ -143,6 +162,33 @@ class SemanticRepository:
                     (build_id, limit),
                 )
             )
+
+    def replace_window_with_segments(
+        self, *, window_id: int, segments: list[WindowRecord]
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM semantic_vectors WHERE window_id = ?", (window_id,))
+            conn.execute("DELETE FROM semantic_windows WHERE window_id = ?", (window_id,))
+            for row in segments:
+                conn.execute(
+                    """
+                    INSERT INTO semantic_windows (
+                        build_id, cgid, record_id, doc_id, start_unit_no, end_unit_no,
+                        segment_index, segment_count,
+                        window_text, char_len, token_count_est, text_hash,
+                        source_content_hash, source_max_updated_at, source_unit_signature,
+                        created_at
+                    ) VALUES (
+                        :build_id, :cgid, :record_id, :doc_id, :start_unit_no, :end_unit_no,
+                        :segment_index, :segment_count,
+                        :window_text, :char_len, :token_count_est, :text_hash,
+                        :source_content_hash, :source_max_updated_at, :source_unit_signature,
+                        :created_at
+                    )
+                    """,
+                    asdict(row),
+                )
+            conn.commit()
 
     def count_windows_for_build(self, build_id: int) -> int:
         with self.connect() as conn:

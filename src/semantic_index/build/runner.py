@@ -14,6 +14,8 @@ from semantic_index.db.init_db import initialize_database
 from semantic_index.db.repository import SemanticRepository
 from semantic_index.pipeline.embedder import DeterministicEmbedder, OpenAIEmbedder
 from semantic_index.pipeline.source_reader import SourceReader
+from semantic_index.pipeline.tokenizer import estimate_tokens, split_text_by_tokens
+from semantic_index.pipeline.types import WindowRecord
 from semantic_index.pipeline.validator import validate_build_output
 from semantic_index.pipeline.vector_store import vector_to_blob
 from semantic_index.pipeline.window_builder import build_windows
@@ -278,6 +280,8 @@ def _persist_windows(
             embedding_model=settings.openai_embedding_model,
             window_size_units=settings.window_size_units,
             window_stride_units=settings.window_stride_units,
+            max_embedding_input_tokens=settings.max_embedding_input_tokens,
+            oversized_window_overlap_tokens=settings.oversized_window_overlap_tokens,
         )
         if windows:
             repository.insert_windows(windows)
@@ -310,6 +314,21 @@ def _embed_pending_windows(
         )
         if not rows:
             break
+
+        oversized_row = next(
+            (
+                row
+                for row in rows
+                if int(row["token_count_est"]) > settings.max_embedding_input_tokens
+            ),
+            None,
+        )
+        if oversized_row is not None and _split_oversized_pending_window(
+            settings=settings,
+            repository=repository,
+            row=oversized_row,
+        ):
+            continue
 
         batch_rows = _select_embedding_batch(
             rows=rows,
@@ -369,6 +388,53 @@ def _embed_pending_windows(
     return processed
 
 
+def _split_oversized_pending_window(
+    *, settings: Settings, repository: SemanticRepository, row
+) -> bool:
+    if int(row["token_count_est"]) <= settings.max_embedding_input_tokens:
+        return False
+
+    segments = split_text_by_tokens(
+        text=row["window_text"],
+        model=settings.openai_embedding_model,
+        max_tokens=settings.max_embedding_input_tokens,
+        overlap_tokens=settings.oversized_window_overlap_tokens,
+    )
+    replacement_rows = [
+        WindowRecord(
+            build_id=int(row["build_id"]),
+            cgid=row["cgid"],
+            record_id=int(row["record_id"]),
+            doc_id=row["doc_id"],
+            start_unit_no=int(row["start_unit_no"]),
+            end_unit_no=int(row["end_unit_no"]),
+            segment_index=segment_index,
+            segment_count=len(segments),
+            window_text=segment_text,
+            char_len=len(segment_text),
+            token_count_est=estimate_tokens(segment_text, settings.openai_embedding_model),
+            text_hash=_hash_text(segment_text),
+            source_content_hash=row["source_content_hash"],
+            source_max_updated_at=row["source_max_updated_at"],
+            source_unit_signature=row["source_unit_signature"],
+            created_at=row["created_at"],
+        )
+        for segment_index, segment_text in enumerate(segments)
+    ]
+    repository.replace_window_with_segments(
+        window_id=int(row["window_id"]),
+        segments=replacement_rows,
+    )
+    LOGGER.warning(
+        "Split oversized window build_id=%s window_id=%s original_tokens=%s new_segments=%s",
+        row["build_id"],
+        row["window_id"],
+        row["token_count_est"],
+        len(replacement_rows),
+    )
+    return True
+
+
 def _select_embedding_batch(
     *, rows: list[Any], batch_size: int, token_budget: int
 ) -> list[Any]:
@@ -400,6 +466,12 @@ def _parse_retry_after_seconds(message: str) -> float | None:
 def _parse_rate_limit_tpm_limit(message: str) -> int | None:
     match = RATE_LIMIT_LIMIT_RE.search(message)
     return None if match is None else int(match.group(1))
+
+
+def _hash_text(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _determine_dirty_record_ids(

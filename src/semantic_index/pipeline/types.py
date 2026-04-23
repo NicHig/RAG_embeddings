@@ -23,6 +23,8 @@ class WindowRecord:
     doc_id: str
     start_unit_no: int
     end_unit_no: int
+    segment_index: int
+    segment_count: int
     window_text: str
     char_len: int
     token_count_est: int

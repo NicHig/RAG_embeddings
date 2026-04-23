@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS semantic_windows (
     doc_id TEXT NOT NULL,
     start_unit_no INTEGER NOT NULL,
     end_unit_no INTEGER NOT NULL,
+    segment_index INTEGER NOT NULL DEFAULT 0,
+    segment_count INTEGER NOT NULL DEFAULT 1,
     window_text TEXT NOT NULL,
     char_len INTEGER NOT NULL,
     token_count_est INTEGER NOT NULL,

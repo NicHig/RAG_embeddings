@@ -16,6 +16,8 @@ def test_build_windows_for_three_units():
         embedding_model="text-embedding-3-small",
         window_size_units=3,
         window_stride_units=1,
+        max_embedding_input_tokens=8192,
+        oversized_window_overlap_tokens=256,
     )
     assert warnings == []
     assert len(windows) == 1
@@ -37,6 +39,8 @@ def test_build_windows_skips_missing_text_and_records_warning():
         embedding_model="text-embedding-3-small",
         window_size_units=3,
         window_stride_units=1,
+        max_embedding_input_tokens=8192,
+        oversized_window_overlap_tokens=256,
     )
     assert len(windows) == 1
     assert warnings
@@ -50,3 +54,23 @@ def test_select_embedding_batch_respects_batch_size_and_token_budget():
     ]
     selected = _select_embedding_batch(rows=rows, batch_size=2, token_budget=210)
     assert [row["window_id"] for row in selected] == [1]
+
+
+def test_build_windows_splits_oversized_window():
+    large_text = "token " * 9000
+    units = [
+        SourceUnit("C1", 12, "doc-12", 1, large_text, "hash", "2026-01-01T00:00:00+00:00", None),
+    ]
+    windows, warnings = build_windows(
+        build_id=1,
+        units=units,
+        embedding_model="text-embedding-3-small",
+        window_size_units=3,
+        window_stride_units=1,
+        max_embedding_input_tokens=8192,
+        oversized_window_overlap_tokens=256,
+    )
+    assert warnings == []
+    assert len(windows) >= 2
+    assert all(window.token_count_est <= 8192 for window in windows)
+    assert windows[0].segment_count == len(windows)

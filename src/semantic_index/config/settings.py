@@ -31,6 +31,8 @@ class Settings:
     embed_token_budget: int = 250000
     embed_min_batch_size: int = 10
     embed_min_token_budget: int = 25000
+    max_embedding_input_tokens: int = 8192
+    oversized_window_overlap_tokens: int = 256
     embedding_mode: str = "sync"
     openai_tpm_limit: int | None = None
     openai_tpm_target_ratio: float = 0.85
@@ -65,6 +67,12 @@ class Settings:
             embed_token_budget=int(os.environ.get("EMBED_TOKEN_BUDGET", "250000")),
             embed_min_batch_size=int(os.environ.get("EMBED_MIN_BATCH_SIZE", "10")),
             embed_min_token_budget=int(os.environ.get("EMBED_MIN_TOKEN_BUDGET", "25000")),
+            max_embedding_input_tokens=int(
+                os.environ.get("MAX_EMBEDDING_INPUT_TOKENS", "8192")
+            ),
+            oversized_window_overlap_tokens=int(
+                os.environ.get("OVERSIZED_WINDOW_OVERLAP_TOKENS", "256")
+            ),
             embedding_mode=os.environ.get("EMBEDDING_MODE", "sync"),
             openai_tpm_limit=(
                 int(os.environ["OPENAI_TPM_LIMIT"])
